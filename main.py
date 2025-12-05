@@ -2776,7 +2776,7 @@ async def wiki_edit(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="wiki_delete",
-    description="위키 글을 삭제합니다.",
+    description="위키에 등록된 정보를 삭제합니다.",
     guild=GUILD_OBJECT,
 )
 @app_commands.check(is_allowed_guild)
