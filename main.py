@@ -24,10 +24,12 @@ def env_int(name: str) -> int:
 # -----------------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# 전부 환경 변수에서 읽기
 ALLOWED_GUILD_ID = env_int("ALLOWED_GUILD_ID")        # 허용 서버 ID
 WIKI_ADMIN_ROLE_ID = env_int("WIKI_ADMIN_ROLE_ID")    # 삭제 가능 역할 ID
 WIKI_EDITOR_ROLE_ID = env_int("WIKI_EDITOR_ROLE_ID")  # 추가/수정/조회 역할 ID
+
+# 이 길드에만 슬래시 명령어를 등록
+GUILD_OBJECT = discord.Object(id=ALLOWED_GUILD_ID)
 
 # 기본 카테고리 (예시)
 CATEGORIES = ["공지", "게임", "봇사용법"]
@@ -51,14 +53,14 @@ def is_allowed_guild(interaction: discord.Interaction) -> bool:
 
 
 def has_wiki_admin_role(interaction: discord.Interaction) -> bool:
-    """특정 역할이 있어야 삭제 명령어를 쓸 수 있게 체크"""
+    """삭제 명령어 전용 역할 체크"""
     if not isinstance(interaction.user, discord.Member):
         return False
     return any(role.id == WIKI_ADMIN_ROLE_ID for role in interaction.user.roles)
 
 
 def has_wiki_editor_role(interaction: discord.Interaction) -> bool:
-    """추가/수정/조회 명령어를 사용할 수 있는 역할 체크 (에디터 전용)"""
+    """추가/수정/조회 명령어 전용 역할 체크"""
     if not isinstance(interaction.user, discord.Member):
         return False
     return any(role.id == WIKI_EDITOR_ROLE_ID for role in interaction.user.roles)
@@ -191,7 +193,11 @@ class NewArticleView(discord.ui.View):
 # -----------------------------
 # 명령어: 새 글 등록 (/wiki_new)
 # -----------------------------
-@bot.tree.command(name="wiki_new", description="위키에 새 글을 등록합니다.")
+@bot.tree.command(
+    name="wiki_new",
+    description="위키에 새 글을 등록합니다.",
+    guild=GUILD_OBJECT,  # 길드 전용 명령어
+)
 @app_commands.check(is_allowed_guild)
 @app_commands.check(has_wiki_editor_or_admin)  # 에디터 또는 관리자
 async def wiki_new(interaction: discord.Interaction):
@@ -222,9 +228,13 @@ category_choices = [
 ]
 
 
-@bot.tree.command(name="wiki_view", description="위키 글을 조회합니다.")
+@bot.tree.command(
+    name="wiki_view",
+    description="위키 글을 조회합니다.",
+    guild=GUILD_OBJECT,
+)
 @app_commands.check(is_allowed_guild)
-@app_commands.check(has_wiki_editor_or_admin)  # 에디터 또는 관리자
+@app_commands.check(has_wiki_editor_or_admin)
 @app_commands.describe(category="조회할 카테고리", title="글 제목")
 @app_commands.choices(category=category_choices)
 async def wiki_view(
@@ -327,9 +337,13 @@ class EditArticleModal(discord.ui.Modal):
         )
 
 
-@bot.tree.command(name="wiki_edit", description="위키 글을 수정합니다.")
+@bot.tree.command(
+    name="wiki_edit",
+    description="위키 글을 수정합니다.",
+    guild=GUILD_OBJECT,
+)
 @app_commands.check(is_allowed_guild)
-@app_commands.check(has_wiki_editor_or_admin)  # 에디터 또는 관리자
+@app_commands.check(has_wiki_editor_or_admin)
 @app_commands.describe(category="수정할 카테고리", title="글 제목")
 @app_commands.choices(category=category_choices)
 async def wiki_edit(
@@ -369,7 +383,11 @@ async def wiki_edit_error(interaction: discord.Interaction, error: app_commands.
 # 명령어: 글 삭제 (/wiki_delete)
 # - 특정 역할만 가능 (관리자 역할)
 # -----------------------------
-@bot.tree.command(name="wiki_delete", description="위키 글을 삭제합니다.")
+@bot.tree.command(
+    name="wiki_delete",
+    description="위키 글을 삭제합니다.",
+    guild=GUILD_OBJECT,
+)
 @app_commands.check(is_allowed_guild)
 @app_commands.check(has_wiki_admin_role)
 @app_commands.describe(category="삭제할 카테고리", title="글 제목")
@@ -421,9 +439,7 @@ async def on_ready():
     print("✅ DB 초기화 완료 (메모리 저장소 사용)")
 
     try:
-        # 특정 길드에만 슬래시 명령어 동기화
-        guild_obj = discord.Object(id=ALLOWED_GUILD_ID)
-        synced = await bot.tree.sync(guild=guild_obj)
+        synced = await bot.tree.sync(guild=GUILD_OBJECT)
         print(f"✅ 슬래시 명령어 {len(synced)}개 길드 동기화 완료 (guild_id={ALLOWED_GUILD_ID})")
         print("✅ 봇 준비 완료 & 슬래시 명령어 동기화 완료")
     except Exception as e:
