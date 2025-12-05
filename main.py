@@ -6,7 +6,7 @@ from typing import Optional, List, Tuple
 
 import asyncpg
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 # =============================
@@ -95,7 +95,6 @@ async def init_db(pool: asyncpg.Pool):
             """
         )
 
-        # 설명 컬럼 없을 수도 있으니 보강
         await conn.execute(
             """
             ALTER TABLE wiki_categories
@@ -154,7 +153,7 @@ async def init_db(pool: asyncpg.Pool):
                 created_by_name TEXT,
                 created_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ,
-                op_type TEXT NOT NULL,   -- "edit" / "delete"
+                op_type TEXT NOT NULL,
                 actor_id BIGINT,
                 backed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -221,40 +220,6 @@ async def db_add_category(guild_id: int, name: str, description: Optional[str]) 
             return "ok"
 
 
-async def db_delete_category(guild_id: int, name: str, actor_id: int) -> Tuple[str, int]:
-    """
-    카테고리 삭제 (포함된 글 전체 백업 후 삭제)
-    return: (status, 삭제된 글 수)
-    """
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            cat_row = await conn.fetchrow(
-                "SELECT id FROM wiki_categories WHERE guild_id=$1 AND name=$2",
-                guild_id,
-                name,
-            )
-            if not cat_row:
-                return "no_category", 0
-            cat_id = cat_row["id"]
-
-            art_rows = await conn.fetch(
-                "SELECT id FROM wiki_articles WHERE category_id=$1",
-                cat_id,
-            )
-
-            for ar in art_rows:
-                await db_backup_current_article(conn, ar["id"], "delete", actor_id)
-
-            deleted_count = len(art_rows)
-
-            await conn.execute("DELETE FROM wiki_categories WHERE id=$1", cat_id)
-            return "ok", deleted_count
-
-# =============================
-# DB 헬퍼 함수 (백업)
-# =============================
-
 async def db_backup_current_article(conn: asyncpg.Connection, article_id: int, op_type: str, actor_id: int):
     """
     현재 글 상태를 백업 테이블에 저장.
@@ -302,6 +267,40 @@ async def db_backup_current_article(conn: asyncpg.Connection, article_id: int, o
         actor_id,
     )
 
+
+async def db_delete_category(guild_id: int, name: str, actor_id: int) -> Tuple[str, int]:
+    """
+    카테고리 삭제 (포함된 글 전체 백업 후 삭제)
+    return: (status, 삭제된 글 수)
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            cat_row = await conn.fetchrow(
+                "SELECT id FROM wiki_categories WHERE guild_id=$1 AND name=$2",
+                guild_id,
+                name,
+            )
+            if not cat_row:
+                return "no_category", 0
+            cat_id = cat_row["id"]
+
+            art_rows = await conn.fetch(
+                "SELECT id FROM wiki_articles WHERE category_id=$1",
+                cat_id,
+            )
+
+            for ar in art_rows:
+                await db_backup_current_article(conn, ar["id"], "delete", actor_id)
+
+            deleted_count = len(art_rows)
+
+            await conn.execute("DELETE FROM wiki_categories WHERE id=$1", cat_id)
+            return "ok", deleted_count
+
+# =============================
+# DB 헬퍼 함수 (백업 조회)
+# =============================
 
 async def db_get_last_backup_for_user(guild_id: int, user_id: int) -> Optional[asyncpg.Record]:
     """
@@ -590,6 +589,62 @@ async def db_search_articles(guild_id: int, query: str, limit: int = 10) -> List
             limit,
         )
         return rows
+
+# =============================
+# 백업 정리(최적화) 작업
+# =============================
+
+async def compact_backups_once():
+    """
+    - article_id 가 살아있는 백업들은 현재 wiki_articles 내용으로 동기화
+    - article_id 가 NULL 인(= 실제 글이 이미 삭제된) 백업들은 삭제
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            updated = await conn.execute(
+                """
+                UPDATE wiki_article_backups AS b
+                SET category_name   = c.name,
+                    title           = a.title,
+                    content         = a.content,
+                    created_by_id   = a.created_by_id,
+                    created_by_name = a.created_by_name,
+                    created_at      = a.created_at,
+                    updated_at      = a.updated_at
+                FROM wiki_articles AS a
+                JOIN wiki_categories AS c
+                  ON c.id = a.category_id
+                WHERE b.article_id = a.id
+                  AND b.guild_id   = a.guild_id;
+                """
+            )
+
+            deleted = await conn.execute(
+                """
+                DELETE FROM wiki_article_backups
+                WHERE article_id IS NULL;
+                """
+            )
+
+    print(f"⏱️ 백업 정리 1회 실행 완료. 결과: {updated}, {deleted}")
+
+
+@tasks.loop(hours=24)
+async def backup_maintenance_task():
+    """
+    24시간 간격으로 백업 정리 작업 실행
+    """
+    try:
+        await compact_backups_once()
+    except Exception as e:
+        print("❌ 백업 정리 작업 중 오류:", e)
+
+
+@backup_maintenance_task.before_loop
+async def before_backup_maintenance_task():
+    await bot.wait_until_ready()
+    print("⏱️ 백업 정리 작업 대기 완료. 봇 준비 후 24시간 간격으로 실행됩니다.")
 
 # =============================
 # 이미지 URL 추출 + 공통 Embed 생성
@@ -1580,7 +1635,7 @@ class CategoryPickerView(discord.ui.View):
         value = select.values[0]
         if value == "_none":
             await interaction.response.send_message(
-                "등록된 카테고리가 없습니다. `/wiki_category_add` 로 카테고리를 추가해 주세요.",
+                "등록된 카테고리가 없습니다. `/wiki_category_add` 로 먼저 카테고리를 추가해 주세요.",
                 ephemeral=True,
             )
             return
@@ -1592,7 +1647,6 @@ class CategoryPickerView(discord.ui.View):
             await interaction.response.send_modal(modal)
             return
 
-        # view / edit / delete → 글 선택 뷰로 전환
         articles = await db_get_articles_in_category(self.guild_id, category_name)
         if not articles:
             await interaction.response.send_message(
@@ -1739,7 +1793,6 @@ class CategoryDeletePickerView(discord.ui.View):
 # Slash 명령어들
 # =============================
 
-# --- 새 글 작성 ---
 @bot.tree.command(
     name="wiki_new",
     description="위키에 새 글을 등록합니다.",
@@ -1776,7 +1829,7 @@ async def wiki_new(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-# --- 글 조회 ---
+
 @bot.tree.command(
     name="wiki_view",
     description="위키 글을 조회합니다.",
@@ -1813,7 +1866,7 @@ async def wiki_view(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-# --- 글 수정 ---
+
 @bot.tree.command(
     name="wiki_edit",
     description="위키 글을 수정합니다.",
@@ -1850,7 +1903,7 @@ async def wiki_edit(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-# --- 글 삭제 ---
+
 @bot.tree.command(
     name="wiki_delete",
     description="위키 글을 삭제합니다.",
@@ -1887,7 +1940,7 @@ async def wiki_delete(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-# --- 카테고리 추가 ---
+
 @bot.tree.command(
     name="wiki_category_add",
     description="새 카테고리를 추가합니다.",
@@ -1925,7 +1978,7 @@ async def wiki_category_add(
         ephemeral=True,
     )
 
-# --- 카테고리 삭제 ---
+
 @bot.tree.command(
     name="wiki_category_delete",
     description="카테고리를 삭제합니다. (안의 글도 모두 함께 삭제)",
@@ -1962,7 +2015,7 @@ async def wiki_category_delete(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-# --- 백업 복구 ---
+
 @bot.tree.command(
     name="wiki_backup_restore",
     description="직전에 수정/삭제했던 내용을 되돌립니다.",
@@ -2014,6 +2067,62 @@ async def wiki_backup_restore(interaction: discord.Interaction):
         ephemeral=True,
     )
 
+
+@bot.tree.command(
+    name="wiki_cleanup_status",
+    description="다음 데이터 정리까지 남은 시간을 확인합니다.",
+    guild=GUILD_OBJECT,
+)
+@app_commands.check(is_allowed_guild)
+@app_commands.check(has_wiki_editor_or_admin)
+async def wiki_cleanup_status(interaction: discord.Interaction):
+    if not backup_maintenance_task.is_running():
+        await interaction.response.send_message(
+            "데이터 정리 작업이 아직 시작되지 않았습니다.",
+            ephemeral=True,
+        )
+        return
+
+    next_iter = backup_maintenance_task.next_iteration
+    if next_iter is None:
+        await interaction.response.send_message(
+            "다음 데이터 정리 시각을 계산 중입니다.",
+            ephemeral=True,
+        )
+        return
+
+    now = discord.utils.utcnow()
+    delta = next_iter - now
+    total_seconds = int(delta.total_seconds())
+
+    if total_seconds <= 0:
+        msg = "곧 데이터 정리 작업이 실행될 예정입니다."
+    else:
+        days = total_seconds // 86400
+        remain = total_seconds % 86400
+        hours = remain // 3600
+        remain %= 3600
+        minutes = remain // 60
+        seconds = remain % 60
+
+        parts = []
+        if days:
+            parts.append(f"{days}일")
+        if hours:
+            parts.append(f"{hours}시간")
+        if minutes:
+            parts.append(f"{minutes}분")
+        if seconds or not parts:
+            parts.append(f"{seconds}초")
+
+        human = " ".join(parts)
+        msg = f"⏱️ 다음 데이터 정리까지 남은 시간: **{human}**"
+
+    await interaction.response.send_message(
+        msg,
+        ephemeral=True,
+    )
+
 # =============================
 # on_ready
 # =============================
@@ -2022,13 +2131,16 @@ async def wiki_backup_restore(interaction: discord.Interaction):
 async def on_ready():
     print(f"✅ 봇 로그인 완료: {bot.user} (ID: {bot.user.id})")
     try:
-        # DB 초기화 보장
         await get_db_pool()
         print("✅ DB 초기화 완료")
 
         synced = await bot.tree.sync(guild=GUILD_OBJECT)
         print(f"✅ 슬래시 명령어 {len(synced)}개 길드 동기화 완료 (guild_id={ALLOWED_GUILD_ID})")
         print("✅ 봇 준비 완료 & 슬래시 명령어 동기화 완료")
+
+        if not backup_maintenance_task.is_running():
+            backup_maintenance_task.start()
+            print("⏱️ 백업 정리 작업 시작 (24시간 간격)")
     except Exception as e:
         print("❌ 초기화 중 오류:", e)
 
