@@ -3,6 +3,7 @@ import re
 import math
 import asyncio
 from typing import Optional, List, Tuple
+from urllib.parse import urlsplit  # 이미지 URL 분석용
 
 import asyncpg
 import discord
@@ -42,7 +43,7 @@ GUILD_OBJECT = discord.Object(id=ALLOWED_GUILD_ID)
 # =============================
 
 intents = discord.Intents.default()
-intents.guilds = True  # 길드 정보
+intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =============================
@@ -654,12 +655,25 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 
 def extract_image_url_from_content(content: str) -> Optional[str]:
+    """
+    내용 문자열 안에서 이미지 URL을 하나 찾아서 반환.
+    - https://... 형태의 URL 중에서
+    - path 부분이 .png / .jpg / .jpeg / .gif / .webp 로 끝나는 것을 이미지로 인식
+    - URL 뒤에 ?query=... 나 & 가 붙어 있어도 정상 인식하도록 처리
+    """
     urls = re.findall(r"(https?://\S+)", content)
+
     for url in urls:
-        cleaned = url.strip(".,);>]\"'")
-        lower = cleaned.lower()
-        if any(lower.endswith(ext) for ext in IMAGE_EXTENSIONS):
+        # 문장부호/마크다운 등으로 붙은 것 제거
+        cleaned = url.strip(".,);>\"'&")
+        cleaned = cleaned.strip("<>")
+
+        parsed = urlsplit(cleaned)
+        path_lower = parsed.path.lower()
+
+        if any(path_lower.endswith(ext) for ext in IMAGE_EXTENSIONS):
             return cleaned
+
     return None
 
 
