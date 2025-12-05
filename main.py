@@ -3,7 +3,7 @@ import re
 import math
 import asyncio
 from typing import Optional, List, Tuple
-from urllib.parse import urlsplit  # 이미지 URL 분석용
+from urllib.parse import urlsplit
 
 import asyncpg
 import discord
@@ -648,62 +648,104 @@ async def before_backup_maintenance_task():
     print("⏱️ 백업 정리 작업 대기 완료. 봇 준비 후 24시간 간격으로 실행됩니다.")
 
 # =============================
-# 이미지 URL 추출 + 공통 Embed 생성
+# 이미지 URL 처리 + Embed 생성
 # =============================
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 
-def extract_image_url_from_content(content: str) -> Optional[str]:
+def split_content_and_images(content: str) -> Tuple[str, List[str]]:
     """
-    내용 문자열 안에서 이미지 URL을 하나 찾아서 반환.
-    - https://... 형태의 URL 중에서
-    - path 부분이 .png / .jpg / .jpeg / .gif / .webp 로 끝나는 것을 이미지로 인식
-    - URL 뒤에 ?query=... 나 & 가 붙어 있어도 정상 인식하도록 처리
+    내용 문자열 안에서 여러 이미지 URL을 찾아:
+    - 내용에서는 각 이미지 URL을 '[이미지1]', '[이미지2]' ... 로 치환하고
+    - 이미지 URL 리스트를 순서대로 반환한다.
     """
-    urls = re.findall(r"(https?://\S+)", content)
+    image_urls: List[str] = []
+    index = 0
 
-    for url in urls:
-        # 문장부호/마크다운 등으로 붙은 것 제거
-        cleaned = url.strip(".,);>\"'&")
-        cleaned = cleaned.strip("<>")
+    def repl(match):
+        nonlocal index, image_urls
+        raw_url = match.group(0)
+
+        cleaned = raw_url.strip(".,);>\"'&").strip("<>")
 
         parsed = urlsplit(cleaned)
         path_lower = parsed.path.lower()
 
         if any(path_lower.endswith(ext) for ext in IMAGE_EXTENSIONS):
-            return cleaned
+            index += 1
+            image_urls.append(cleaned)
+            return f"[이미지{index}]"
+        else:
+            return raw_url
 
-    return None
+    cleaned_content = re.sub(r"(https?://\S+)", repl, content)
+    return cleaned_content, image_urls
 
 
-def build_article_embed(art_row: asyncpg.Record, contrib_rows: List[asyncpg.Record]) -> discord.Embed:
-    contrib_lines = []
-    for cr in contrib_rows:
-        contrib_lines.append(f"- <@{cr['user_id']}>: {cr['count']}회")
+def build_article_embeds(
+    art_row: asyncpg.Record,
+    contrib_rows: List[asyncpg.Record],
+) -> List[discord.Embed]:
+    """
+    글 1개를 여러 Embed로 분리해서 반환:
+    - 첫 번째 Embed: 텍스트(본문) + 작성자/기여자 정보
+    - 이후 Embed들: 이미지 전용 embed (이미지 개수만큼, 제한 없음)
+    """
+    cleaned_content, image_urls = split_content_and_images(art_row["content"])
+
+    contrib_lines = [
+        f"- <@{cr['user_id']}>: {cr['count']}회" for cr in contrib_rows
+    ]
     contrib_text = "\n".join(contrib_lines) if contrib_lines else "없음"
 
-    embed = discord.Embed(
+    main_embed = discord.Embed(
         title=f"[{art_row['category']}] {art_row['title']}",
-        description=art_row["content"],
+        description=cleaned_content,
         color=discord.Color.blurple(),
     )
-    embed.add_field(
+    main_embed.add_field(
         name="최초 작성자",
         value=f"{art_row['created_by_name']} (<@{art_row['created_by_id']}>)",
         inline=False,
     )
-    embed.add_field(
+    main_embed.add_field(
         name="기여자 / 기여 횟수",
         value=contrib_text,
         inline=False,
     )
 
-    img_url = extract_image_url_from_content(art_row["content"])
-    if img_url:
-        embed.set_image(url=img_url)
+    embeds: List[discord.Embed] = [main_embed]
 
-    return embed
+    for idx, url in enumerate(image_urls):
+        img_embed = discord.Embed(color=discord.Color.blurple())
+        img_embed.set_image(url=url)
+        img_embed.set_footer(text=f"이미지 {idx + 1}")
+        embeds.append(img_embed)
+
+    return embeds
+
+
+async def send_embeds_with_chunking(
+    interaction: discord.Interaction,
+    embeds: List[discord.Embed],
+    ephemeral: bool = False,
+):
+    """
+    디스코드 제한(메시지당 최대 10개 embed)을 고려하여
+    여러 번의 메시지로 나누어 embed들을 전송한다.
+    """
+    if not embeds:
+        return
+
+    MAX_EMBEDS = 10
+    first_chunk = embeds[:MAX_EMBEDS]
+    await interaction.response.send_message(embeds=first_chunk, ephemeral=ephemeral)
+
+    remaining = embeds[MAX_EMBEDS:]
+    for i in range(0, len(remaining), MAX_EMBEDS):
+        chunk = remaining[i : i + MAX_EMBEDS]
+        await interaction.followup.send(embeds=chunk, ephemeral=ephemeral)
 
 # =============================
 # UI: 새 글 작성 모달
@@ -1256,8 +1298,8 @@ class SearchResultView(discord.ui.View):
                 )
                 return
 
-            embed = build_article_embed(art_row, contrib_rows)
-            await interaction.response.send_message(embed=embed, ephemeral=False)
+            embeds = build_article_embeds(art_row, contrib_rows)
+            await send_embeds_with_chunking(interaction, embeds, ephemeral=False)
             return
 
         if self.mode == "edit":
@@ -1463,8 +1505,8 @@ class ArticlePickerView(discord.ui.View):
                 )
                 return
 
-            embed = build_article_embed(art_row, contrib_rows)
-            await interaction.response.send_message(embed=embed, ephemeral=False)
+            embeds = build_article_embeds(art_row, contrib_rows)
+            await send_embeds_with_chunking(interaction, embeds, ephemeral=False)
             return
 
         if self.mode == "edit":
@@ -1500,7 +1542,6 @@ class ArticlePickerView(discord.ui.View):
                 ephemeral=True,
             )
             return
-
 
 class CategoryPickerView(discord.ui.View):
     def __init__(
