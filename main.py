@@ -48,30 +48,48 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =============================
+# 커스텀 권한 예외
+# =============================
+
+class MissingWikiPermission(app_commands.CheckFailure):
+    """필요한 위키 역할이 없을 때 발생시키는 예외"""
+    pass
+
+# =============================
 # 권한 체크
 # =============================
 
 def is_allowed_guild(interaction: discord.Interaction) -> bool:
+    """허용된 길드(서버)인지 체크"""
     return interaction.guild is not None and interaction.guild.id == ALLOWED_GUILD_ID
 
 
 def has_wiki_admin_role(interaction: discord.Interaction) -> bool:
+    """삭제/카테고리 삭제 등 관리자 전용 역할 체크"""
     if not isinstance(interaction.user, discord.Member):
-        return False
-    return any(role.id == WIKI_ADMIN_ROLE_ID for role in interaction.user.roles)
+        raise MissingWikiPermission()
+    if not any(role.id == WIKI_ADMIN_ROLE_ID for role in interaction.user.roles):
+        raise MissingWikiPermission()
+    return True
 
 
 def has_wiki_editor_role(interaction: discord.Interaction) -> bool:
+    """(현재는 직접 데코레이터로 쓰이진 않지만) 에디터 전용 역할 체크"""
     if not isinstance(interaction.user, discord.Member):
-        return False
-    return any(role.id == WIKI_EDITOR_ROLE_ID for role in interaction.user.roles)
+        raise MissingWikiPermission()
+    if not any(role.id == WIKI_EDITOR_ROLE_ID for role in interaction.user.roles):
+        raise MissingWikiPermission()
+    return True
 
 
 def has_wiki_editor_or_admin(interaction: discord.Interaction) -> bool:
+    """에디터 또는 관리자 중 하나라도 있으면 통과"""
     if not isinstance(interaction.user, discord.Member):
-        return False
+        raise MissingWikiPermission()
     role_ids = {role.id for role in interaction.user.roles}
-    return (WIKI_EDITOR_ROLE_ID in role_ids) or (WIKI_ADMIN_ROLE_ID in role_ids)
+    if (WIKI_EDITOR_ROLE_ID not in role_ids) and (WIKI_ADMIN_ROLE_ID not in role_ids):
+        raise MissingWikiPermission()
+    return True
 
 # =============================
 # DB 풀 + 초기화
@@ -2334,7 +2352,7 @@ async def wiki_delete(interaction: discord.Interaction):
     guild=GUILD_OBJECT,
 )
 @app_commands.check(is_allowed_guild)
-@app_commands.check(has_wiki_editor_or_admin)  # ⬅ 에디터 OR 관리자 모두 가능
+@app_commands.check(has_wiki_editor_or_admin)  # 에디터 OR 관리자
 @app_commands.describe(
     name="카테고리 이름",
     description="(선택) 카테고리 설명 / 비고",
@@ -2522,6 +2540,42 @@ async def wiki_cleanup_status(interaction: discord.Interaction):
         msg,
         ephemeral=True,
     )
+
+# =============================
+# 전역 Slash 명령어 에러 핸들러
+# =============================
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+    # 필요한 디스코드 역할이 없을 때
+    if isinstance(error, MissingWikiPermission):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "해당 명령어를 사용가능한 권한이 없습니다.",
+                    ephemeral=True,
+                )
+        except Exception:
+            pass
+        return
+
+    # 그 외 체크 실패 (예: 다른 서버, DM 등)
+    if isinstance(error, app_commands.CheckFailure):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "이 봇은 지정된 서버에서만 사용할 수 있습니다.",
+                    ephemeral=True,
+                )
+        except Exception:
+            pass
+        return
+
+    # 디버깅용 로그
+    print("App command error:", repr(error))
 
 # =============================
 # on_ready
