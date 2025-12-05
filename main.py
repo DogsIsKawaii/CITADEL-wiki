@@ -65,7 +65,7 @@ def is_allowed_guild(interaction: discord.Interaction) -> bool:
 
 
 def has_wiki_admin_role(interaction: discord.Interaction) -> bool:
-    """삭제/카테고리 삭제 등 관리자 전용 역할 체크"""
+    """삭제/카테고리 삭제/스냅샷 복구 등 관리자 전용 역할 체크"""
     if not isinstance(interaction.user, discord.Member):
         raise MissingWikiPermission()
     if not any(role.id == WIKI_ADMIN_ROLE_ID for role in interaction.user.roles):
@@ -74,7 +74,7 @@ def has_wiki_admin_role(interaction: discord.Interaction) -> bool:
 
 
 def has_wiki_editor_role(interaction: discord.Interaction) -> bool:
-    """(현재는 직접 데코레이터로 쓰이진 않지만) 에디터 전용 역할 체크"""
+    """에디터 전용 역할 체크 (현재는 개별 데코레이터에서는 사용 X, 참고용)"""
     if not isinstance(interaction.user, discord.Member):
         raise MissingWikiPermission()
     if not any(role.id == WIKI_EDITOR_ROLE_ID for role in interaction.user.roles):
@@ -159,7 +159,7 @@ async def init_db(pool: asyncpg.Pool):
             """
         )
 
-        # 백업 테이블
+        # 개인 백업 테이블
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS wiki_article_backups (
@@ -196,6 +196,31 @@ async def init_db(pool: asyncpg.Pool):
             """
             ALTER TABLE wiki_article_backups
             ADD COLUMN IF NOT EXISTS backed_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+            """
+        )
+
+        # 스냅샷 백업 테이블 (데이터 정리 시점 전체 스냅샷, 최대 3일 보관)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wiki_snapshot_backups (
+                id SERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                article_id INTEGER REFERENCES wiki_articles(id) ON DELETE SET NULL,
+                category_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_by_id BIGINT,
+                created_by_name TEXT,
+                created_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ,
+                snapshot_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE wiki_snapshot_backups
+            ADD COLUMN IF NOT EXISTS snapshot_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
             """
         )
 
@@ -269,7 +294,7 @@ async def db_add_category(guild_id: int, name: str, description: Optional[str]) 
             return "ok"
 
 # =============================
-# DB 헬퍼 (백업 & 백업 목록)
+# DB 헬퍼 (개인 백업 & 목록)
 # =============================
 
 async def db_backup_current_article(
@@ -279,7 +304,7 @@ async def db_backup_current_article(
     actor_id: int,
 ):
     """
-    현재 글 상태를 백업 테이블에 저장.
+    현재 글 상태를 개인 백업 테이블에 저장.
 
     - 사용자별(= guild_id + actor_id 기준)로 백업을 '최근 5개'까지만 유지.
     - 어떤 유저가 6번째 백업을 생성하면 가장 오래된 1개가 밀려나서 삭제됨.
@@ -380,7 +405,7 @@ async def db_get_backups_for_user(
     limit: int = 5,
 ) -> List[asyncpg.Record]:
     """
-    해당 길드 + 해당 유저 기준으로 '최근 N개' 백업 목록 조회.
+    해당 길드 + 해당 유저 기준으로 '최근 N개' 개인 백업 목록 조회.
     단, 마지막 정리 시각(last_cleanup_at) 이후에 생성된 백업만 대상.
     """
     pool = await get_db_pool()
@@ -390,7 +415,6 @@ async def db_get_backups_for_user(
         )
 
         if last_cleanup_at is None:
-            # 아직 정리가 한 번도 안 돌았으면 시간 제한 없이 최근 N개
             rows = await conn.fetch(
                 """
                 SELECT id, article_id, category_name, title, content,
@@ -406,7 +430,6 @@ async def db_get_backups_for_user(
                 limit,
             )
         else:
-            # 마지막 정리 이후에 만들어진 백업만
             rows = await conn.fetch(
                 """
                 SELECT id, article_id, category_name, title, content,
@@ -429,7 +452,7 @@ async def db_get_backups_for_user(
 
 async def db_check_backup_conflict(backup_id: int) -> Tuple[str, Optional[int]]:
     """
-    특정 백업을 복구하기 전에,
+    특정 *개인 백업*을 복구하기 전에,
     같은 정보를 다른 사용자가 이후에 수정/삭제했는지 확인.
 
     return: (conflict_type, other_user_id)
@@ -457,7 +480,7 @@ async def db_check_backup_conflict(backup_id: int) -> Tuple[str, Optional[int]]:
         backed_at = b["backed_at"]
         actor_id = b["actor_id"]
 
-        # 1) article_id 가 남아 있는 경우 (글이 아직 살아있거나, 삭제 전 백업들)
+        # 1) article_id 가 남아 있는 경우
         if article_id is not None:
             later = await conn.fetchrow(
                 """
@@ -479,7 +502,7 @@ async def db_check_backup_conflict(backup_id: int) -> Tuple[str, Optional[int]]:
 
             return "none", None
 
-        # 2) article_id 가 NULL 이면 (이미 글이 삭제된 상태)
+        # 2) article_id 가 NULL 인 경우 (이미 글 삭제된 상태)
         later_del = await conn.fetchrow(
             """
             SELECT actor_id
@@ -634,7 +657,7 @@ async def db_edit_article(
 ):
     """
     제목 + 내용 수정 (제목 변경 시 중복 체크 포함).
-    - 수정 전에 백업 저장.
+    - 수정 전에 개인 백업 저장.
     """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
@@ -675,7 +698,7 @@ async def db_edit_article(
                 if dup_row:
                     return "dup_title", None
 
-            # 수정 전 백업
+            # 수정 전 개인 백업
             await db_backup_current_article(conn, article_id, "edit", user_id)
 
             await conn.execute(
@@ -744,7 +767,7 @@ async def db_delete_article(
 
             article_id = art_row["id"]
 
-            # 삭제 전 백업
+            # 삭제 전 개인 백업
             await db_backup_current_article(conn, article_id, "delete", actor_id)
 
             await conn.execute("DELETE FROM wiki_articles WHERE id=$1", article_id)
@@ -772,26 +795,95 @@ async def db_search_articles(guild_id: int, query: str, limit: int = 10) -> List
         return rows
 
 # =============================
-# 백업 정리(24시간마다)
+# DB 헬퍼 (스냅샷 조회)
+# =============================
+
+async def db_get_snapshots_for_article(
+    guild_id: int,
+    category_name: str,
+    title: str,
+    limit: int = 10,
+) -> List[asyncpg.Record]:
+    """
+    스냅샷 테이블에서 특정 글(카테고리+제목)에 대한 최근 스냅샷 목록 조회
+    (데이터 정리에서 3일 이상 지난 것은 이미 삭제됨)
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, article_id, guild_id, category_name, title, content,
+                   created_by_id, created_by_name, created_at, updated_at, snapshot_at
+            FROM wiki_snapshot_backups
+            WHERE guild_id=$1 AND category_name=$2 AND title=$3
+            ORDER BY snapshot_at DESC
+            LIMIT $4
+            """,
+            guild_id,
+            category_name,
+            title,
+            limit,
+        )
+        return rows
+
+# =============================
+# 백업 정리(24시간마다) + 스냅샷 생성
 # =============================
 
 async def compact_backups_once():
     """
-    백업 테이블 정리 (24시간마다 실행):
+    백업/스냅샷 정리 (24시간마다 실행):
 
-    1) 살아있는 글들(article_id NOT NULL)에 대해
-       - 같은 (article_id, actor_id) 그룹 안에서
-       - 가장 최신(backed_at 기준) 백업 1개만 남기고 나머지 삭제
-
-    2) 이미 실제 글이 삭제되어 article_id 가 NULL 로 된 백업은 전부 삭제
-
-    3) 마지막 정리 시각(last_cleanup_at)을 NOW()로 기록
-       → 이후 /wiki_backup_restore 는 이 시각 이후의 백업만 복구 대상으로 사용
+    1) 현재 존재하는 모든 글을 스냅샷(최신 데이터)으로 wiki_snapshot_backups 에 저장
+    2) snapshot_at 기준으로 3일이 지난 스냅샷 삭제
+    3) 개인 백업(wiki_article_backups)에서
+       - 같은 (article_id, actor_id) 그룹 안에서 가장 최신 백업 1개만 남기고 나머지 삭제
+       - article_id IS NULL (이미 삭제된 글) 백업은 모두 삭제
+    4) wiki_maintenance_meta.last_cleanup_at = NOW()
+       -> 이후 /wiki_backup_restore 는 이 시각 이후의 백업만 복구 가능
     """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # 1) 살아있는 글의 과거 백업 정리
+            # 1) 현재 존재하는 글 전체 스냅샷 저장
+            articles = await conn.fetch(
+                """
+                SELECT a.id, a.guild_id, a.title, a.content,
+                       a.created_by_id, a.created_by_name,
+                       a.created_at, a.updated_at,
+                       c.name AS category_name
+                FROM wiki_articles a
+                JOIN wiki_categories c ON a.category_id = c.id
+                """
+            )
+            for row in articles:
+                await conn.execute(
+                    """
+                    INSERT INTO wiki_snapshot_backups
+                        (guild_id, article_id, category_name, title, content,
+                         created_by_id, created_by_name, created_at, updated_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                    """,
+                    row["guild_id"],
+                    row["id"],
+                    row["category_name"],
+                    row["title"],
+                    row["content"],
+                    row["created_by_id"],
+                    row["created_by_name"],
+                    row["created_at"],
+                    row["updated_at"],
+                )
+
+            # 2) 3일 지난 스냅샷 삭제
+            delete_old_snapshots = await conn.execute(
+                """
+                DELETE FROM wiki_snapshot_backups
+                WHERE snapshot_at < NOW() - INTERVAL '3 days';
+                """
+            )
+
+            # 3-1) 살아있는 글의 과거 개인 백업 정리
             delete_non_latest = await conn.execute(
                 """
                 WITH latest AS (
@@ -806,7 +898,7 @@ async def compact_backups_once():
                 """
             )
 
-            # 2) 이미 삭제된 글의 백업 삭제
+            # 3-2) 이미 삭제된 글의 개인 백업 삭제
             delete_orphans = await conn.execute(
                 """
                 DELETE FROM wiki_article_backups
@@ -814,7 +906,7 @@ async def compact_backups_once():
                 """
             )
 
-            # 3) 정리 시각 기록
+            # 4) 정리 시각 기록
             await conn.execute(
                 """
                 INSERT INTO wiki_maintenance_meta (id, last_cleanup_at)
@@ -825,9 +917,10 @@ async def compact_backups_once():
             )
 
     print(
-        f"⏱️ 백업 정리 1회 실행 완료. "
-        f"살아있는 글의 과거 백업 정리 결과: {delete_non_latest}, "
-        f"고아(삭제된 글) 백업 삭제 결과: {delete_orphans}"
+        "⏱️ 백업 정리 1회 실행 완료.\n"
+        f"- 개인 백업 정리 결과: {delete_non_latest}\n"
+        f"- 고아(삭제된 글) 개인 백업 삭제 결과: {delete_orphans}\n"
+        f"- 3일 지난 스냅샷 삭제 결과: {delete_old_snapshots}"
     )
 
 
@@ -1207,7 +1300,7 @@ class DeleteConfirmView(discord.ui.View):
         )
 
 # =============================
-# UI: 백업 복구 뷰
+# UI: 개인 백업 복구 뷰
 # =============================
 
 class RestoreBackupView(discord.ui.View):
@@ -1324,7 +1417,7 @@ class RestoreBackupView(discord.ui.View):
                     )
                     article_id = art_row["id"]
 
-                # 복구 완료 후, 이 백업은 삭제 (한 번 사용된 백업)
+                # 사용한 개인 백업은 삭제
                 await conn.execute(
                     "DELETE FROM wiki_article_backups WHERE id=$1",
                     backup["id"],
@@ -1353,7 +1446,7 @@ class RestoreBackupView(discord.ui.View):
 
 class BackupListView(discord.ui.View):
     """
-    최근 백업 5개 목록을 Select로 보여주고,
+    최근 개인 백업 5개 목록을 Select로 보여주고,
     선택한 백업에 대해 RestoreBackupView로 복구 여부를 물어보는 뷰.
     """
     def __init__(
@@ -1450,7 +1543,7 @@ class BackupListView(discord.ui.View):
         category_name = target["category_name"]
         title = target["title"]
 
-        # 🔍 충돌 여부 체크 (다른 사용자가 이후에 수정/삭제했는지)
+        # 🔍 다른 사용자가 이후에 수정/삭제했는지 확인
         conflict_type, other_user_id = await db_check_backup_conflict(backup_id)
 
         if other_user_id:
@@ -1503,6 +1596,281 @@ class BackupListView(discord.ui.View):
         )
 
 # =============================
+# UI: 스냅샷 복구 (관리자용)
+# =============================
+
+class SnapshotRestoreView(discord.ui.View):
+    """
+    스냅샷(3일 보관용)에서 글을 실제 데이터로 되돌리는 확인 뷰
+    """
+    def __init__(
+        self,
+        snapshot_id: int,
+        guild_id: int,
+        category_name: str,
+        title: str,
+        requester_id: int,
+    ):
+        super().__init__(timeout=60)
+        self.snapshot_id = snapshot_id
+        self.guild_id = guild_id
+        self.category_name = category_name
+        self.title = title
+        self.requester_id = requester_id
+
+    async def _check_user(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "이 복구 창은 명령어를 실행한 사용자만 사용할 수 있습니다.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _restore(self, interaction: discord.Interaction):
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                snap = await conn.fetchrow(
+                    """
+                    SELECT id, guild_id, article_id, category_name, title, content,
+                           created_by_id, created_by_name, created_at, updated_at, snapshot_at
+                    FROM wiki_snapshot_backups
+                    WHERE id=$1 AND guild_id=$2
+                    """,
+                    self.snapshot_id,
+                    self.guild_id,
+                )
+                if not snap:
+                    await interaction.response.edit_message(
+                        content="해당 스냅샷 데이터를 찾을 수 없습니다.",
+                        view=None,
+                    )
+                    return
+
+                # 카테고리 존재 확인/생성
+                cat_row = await conn.fetchrow(
+                    "SELECT id FROM wiki_categories WHERE guild_id=$1 AND name=$2",
+                    self.guild_id,
+                    snap["category_name"],
+                )
+                if not cat_row:
+                    cat_row = await conn.fetchrow(
+                        """
+                        INSERT INTO wiki_categories (guild_id, name)
+                        VALUES ($1, $2)
+                        RETURNING id
+                        """,
+                        self.guild_id,
+                        snap["category_name"],
+                    )
+                category_id = cat_row["id"]
+
+                article_id = snap["article_id"]
+                if article_id is not None:
+                    current = await conn.fetchrow(
+                        "SELECT id FROM wiki_articles WHERE id=$1",
+                        article_id,
+                    )
+                else:
+                    current = None
+
+                if current:
+                    # 기존 글 덮어쓰기
+                    await conn.execute(
+                        """
+                        UPDATE wiki_articles
+                        SET category_id=$1,
+                            title=$2,
+                            content=$3,
+                            created_by_id=$4,
+                            created_by_name=$5,
+                            created_at=$6,
+                            updated_at=$7
+                        WHERE id=$8
+                        """,
+                        category_id,
+                        snap["title"],
+                        snap["content"],
+                        snap["created_by_id"],
+                        snap["created_by_name"],
+                        snap["created_at"] or discord.utils.utcnow(),
+                        snap["updated_at"] or discord.utils.utcnow(),
+                        article_id,
+                    )
+                else:
+                    # 글이 없어졌다면 새로 생성
+                    art_row = await conn.fetchrow(
+                        """
+                        INSERT INTO wiki_articles
+                            (guild_id, category_id, title, content,
+                             created_by_id, created_by_name, created_at, updated_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                        RETURNING id
+                        """,
+                        self.guild_id,
+                        category_id,
+                        snap["title"],
+                        snap["content"],
+                        snap["created_by_id"],
+                        snap["created_by_name"],
+                        snap["created_at"] or discord.utils.utcnow(),
+                        snap["updated_at"] or discord.utils.utcnow(),
+                    )
+                    article_id = art_row["id"]
+
+                # 스냅샷 자체는 3일 관리용이므로, 여기서 꼭 삭제할 필요는 없음
+                # (보존 정책이 3일이라 next cleanup에서 정리됨)
+                # 원하면 아래 주석 해제해서 "사용한 스냅샷 한 개만 삭제"도 가능
+                # await conn.execute(
+                #     "DELETE FROM wiki_snapshot_backups WHERE id=$1",
+                #     snap["id"],
+                # )
+
+        await interaction.response.edit_message(
+            content=f"✅ [{self.category_name}] `{self.title}` 글을 선택한 스냅샷 상태로 복원했습니다.",
+            view=None,
+        )
+
+    @discord.ui.button(label="예", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_user(interaction):
+            return
+        await self._restore(interaction)
+
+    @discord.ui.button(label="아니오", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_user(interaction):
+            return
+        await interaction.response.edit_message(
+            content="스냅샷 복원을 취소했습니다.",
+            view=None,
+        )
+
+
+class SnapshotListView(discord.ui.View):
+    """
+    특정 글에 대해 최근 3일 안에 저장된 스냅샷 목록을 보여서
+    하나를 선택하고 '정말로 정보를 백업하겠습니까?' 를 묻는 뷰
+    (관리자 전용)
+    """
+    def __init__(
+        self,
+        guild_id: int,
+        category_name: str,
+        title: str,
+        requester_id: int,
+        snapshots: List[asyncpg.Record],
+    ):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.category_name = category_name
+        self.title = title
+        self.requester_id = requester_id
+        self.snapshots = snapshots
+
+        options = []
+        for s in snapshots:
+            ts = s["snapshot_at"]
+            if isinstance(ts, datetime.datetime):
+                time_str = ts.strftime("%Y-%m-%d %H:%M")
+            else:
+                time_str = str(ts)
+
+            label = f"{self.title}"
+            if len(label) > 90:
+                label = label[:87] + "..."
+
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=f"스냅샷 시각: {time_str}",
+                    value=str(s["id"]),
+                )
+            )
+
+        self.select = discord.ui.Select(
+            placeholder="복원할 스냅샷을 선택하세요",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.select.callback = self._on_select
+        self.add_item(self.select)
+
+        cancel_btn = discord.ui.Button(
+            label="취소",
+            style=discord.ButtonStyle.secondary,
+        )
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    async def _check_user(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "이 선택 창은 명령어를 실행한 사용자만 사용할 수 있습니다.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _on_select(self, interaction: discord.Interaction):
+        if not await self._check_user(interaction):
+            return
+
+        snapshot_id = int(self.select.values[0])
+
+        target = None
+        for s in self.snapshots:
+            if s["id"] == snapshot_id:
+                target = s
+                break
+
+        if target is None:
+            await interaction.response.send_message(
+                "선택한 스냅샷 데이터를 찾을 수 없습니다.",
+                ephemeral=True,
+            )
+            return
+
+        ts = target["snapshot_at"]
+        if isinstance(ts, datetime.datetime):
+            time_str = ts.strftime("%Y-%m-%d %H:%M")
+        else:
+            time_str = str(ts)
+
+        text = (
+            "📦 선택한 스냅샷 정보\n"
+            f"- 카테고리: `{self.category_name}`\n"
+            f"- 제목: `{self.title}`\n"
+            f"- 스냅샷 시각: `{time_str}`\n\n"
+            "정말로 정보를 백업하겠습니까?"
+        )
+
+        view = SnapshotRestoreView(
+            snapshot_id=snapshot_id,
+            guild_id=self.guild_id,
+            category_name=self.category_name,
+            title=self.title,
+            requester_id=self.requester_id,
+        )
+
+        await interaction.response.send_message(
+            text,
+            view=view,
+            ephemeral=True,
+        )
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        if not await self._check_user(interaction):
+            return
+
+        await interaction.response.edit_message(
+            content="스냅샷 복원을 취소했습니다.",
+            view=None,
+        )
+
+# =============================
 # UI: 검색 모달 / 검색 결과 뷰
 # =============================
 
@@ -1512,6 +1880,7 @@ class SearchModal(discord.ui.Modal):
             "view": "위키 검색 (조회)",
             "edit": "위키 검색 (수정)",
             "delete": "위키 검색 (삭제)",
+            "snapshot_restore": "위키 검색 (스냅샷 복원)",
         }
         super().__init__(title=title_map.get(mode, "위키 검색"))
 
@@ -1564,6 +1933,8 @@ class SearchModal(discord.ui.Modal):
             action_text = "수정할 글을 선택해 주세요."
         elif self.mode == "delete":
             action_text = "삭제할 글을 선택해 주세요."
+        elif self.mode == "snapshot_restore":
+            action_text = "스냅샷에서 복원할 글을 선택해 주세요."
         else:
             action_text = "처리할 글을 선택해 주세요."
 
@@ -1636,6 +2007,7 @@ class SearchResultView(discord.ui.View):
         category_name = row["category_name"]
         title = row["title"]
 
+        # 조회
         if self.mode == "view":
             art_row, contrib_rows = await db_get_article_for_view(
                 self.guild_id, category_name, title
@@ -1651,6 +2023,7 @@ class SearchResultView(discord.ui.View):
             await send_embeds_with_chunking(interaction, embeds, ephemeral=False)
             return
 
+        # 수정
         if self.mode == "edit":
             art_row, _ = await db_get_article_for_view(
                 self.guild_id, category_name, title
@@ -1671,6 +2044,7 @@ class SearchResultView(discord.ui.View):
             await interaction.response.send_modal(modal)
             return
 
+        # 삭제
         if self.mode == "delete":
             view = DeleteConfirmView(
                 guild_id=self.guild_id,
@@ -1680,6 +2054,47 @@ class SearchResultView(discord.ui.View):
             )
             await interaction.response.send_message(
                 f"🗑️ 정말로 해당 정보를 삭제하시겠습니까?\n\n[{category_name}] `{title}`",
+                view=view,
+                ephemeral=True,
+            )
+            return
+
+        # 스냅샷 복원 (관리자용)
+        if self.mode == "snapshot_restore":
+            snapshots = await db_get_snapshots_for_article(
+                self.guild_id, category_name, title, limit=10
+            )
+            if not snapshots:
+                await interaction.response.send_message(
+                    "해당 글에 대해 최근 3일 이내에 저장된 스냅샷이 없습니다.",
+                    ephemeral=True,
+                )
+                return
+
+            lines = []
+            for i, s in enumerate(snapshots, start=1):
+                ts = s["snapshot_at"]
+                if isinstance(ts, datetime.datetime):
+                    time_str = ts.strftime("%Y-%m-%d %H:%M")
+                else:
+                    time_str = str(ts)
+                lines.append(f"{i}. {title} ({time_str})")
+
+            text = (
+                f"📦 `{category_name}` / `{title}` 의 최근 스냅샷 목록입니다.\n"
+                "복원할 스냅샷을 선택해 주세요.\n\n"
+                + "\n".join(lines)
+            )
+
+            view = SnapshotListView(
+                guild_id=self.guild_id,
+                category_name=category_name,
+                title=title,
+                requester_id=self.requester_id,
+                snapshots=snapshots,
+            )
+            await interaction.response.send_message(
+                text,
                 view=view,
                 ephemeral=True,
             )
@@ -1700,7 +2115,7 @@ class ArticlePickerView(discord.ui.View):
         page: int = 0,
     ):
         super().__init__(timeout=120)
-        self.mode = mode  # "view" / "edit" / "delete"
+        self.mode = mode  # "view" / "edit" / "delete" / "snapshot_restore"
         self.guild_id = guild_id
         self.requester_id = requester_id
         self.category_name = category_name
@@ -1820,6 +2235,8 @@ class ArticlePickerView(discord.ui.View):
             action = "수정할 글을 선택해 주세요."
         elif self.mode == "delete":
             action = "삭제할 글을 선택해 주세요."
+        elif self.mode == "snapshot_restore":
+            action = "스냅샷에서 복원할 글을 선택해 주세요."
         else:
             action = "처리할 글을 선택해 주세요."
 
@@ -1843,6 +2260,7 @@ class ArticlePickerView(discord.ui.View):
 
         title = value
 
+        # 조회
         if self.mode == "view":
             art_row, contrib_rows = await db_get_article_for_view(
                 self.guild_id, self.category_name, title
@@ -1858,6 +2276,7 @@ class ArticlePickerView(discord.ui.View):
             await send_embeds_with_chunking(interaction, embeds, ephemeral=False)
             return
 
+        # 수정
         if self.mode == "edit":
             art_row, _ = await db_get_article_for_view(
                 self.guild_id, self.category_name, title
@@ -1878,6 +2297,7 @@ class ArticlePickerView(discord.ui.View):
             await interaction.response.send_modal(modal)
             return
 
+        # 삭제
         if self.mode == "delete":
             view = DeleteConfirmView(
                 guild_id=self.guild_id,
@@ -1887,6 +2307,47 @@ class ArticlePickerView(discord.ui.View):
             )
             await interaction.response.send_message(
                 f"🗑️ 정말로 해당 정보를 삭제하시겠습니까?\n\n[{self.category_name}] `{title}`",
+                view=view,
+                ephemeral=True,
+            )
+            return
+
+        # 스냅샷 복원
+        if self.mode == "snapshot_restore":
+            snapshots = await db_get_snapshots_for_article(
+                self.guild_id, self.category_name, title, limit=10
+            )
+            if not snapshots:
+                await interaction.response.send_message(
+                    "해당 글에 대해 최근 3일 이내에 저장된 스냅샷이 없습니다.",
+                    ephemeral=True,
+                )
+                return
+
+            lines = []
+            for i, s in enumerate(snapshots, start=1):
+                ts = s["snapshot_at"]
+                if isinstance(ts, datetime.datetime):
+                    time_str = ts.strftime("%Y-%m-%d %H:%M")
+                else:
+                    time_str = str(ts)
+                lines.append(f"{i}. {title} ({time_str})")
+
+            text = (
+                f"📦 `{self.category_name}` / `{title}` 의 최근 스냅샷 목록입니다.\n"
+                "복원할 스냅샷을 선택해 주세요.\n\n"
+                + "\n".join(lines)
+            )
+
+            view = SnapshotListView(
+                guild_id=self.guild_id,
+                category_name=self.category_name,
+                title=title,
+                requester_id=self.requester_id,
+                snapshots=snapshots,
+            )
+            await interaction.response.send_message(
+                text,
                 view=view,
                 ephemeral=True,
             )
@@ -1903,7 +2364,7 @@ class CategoryPickerView(discord.ui.View):
         page: int = 0,
     ):
         super().__init__(timeout=120)
-        self.mode = mode  # "new" / "view" / "edit" / "delete"
+        self.mode = mode  # "new" / "view" / "edit" / "delete" / "snapshot_restore"
         self.guild_id = guild_id
         self.requester_id = requester_id
         self.categories = categories
@@ -2024,6 +2485,8 @@ class CategoryPickerView(discord.ui.View):
             action = "수정할 글이 있는 카테고리를 선택해 주세요."
         elif self.mode == "delete":
             action = "삭제할 글이 있는 카테고리를 선택해 주세요."
+        elif self.mode == "snapshot_restore":
+            action = "스냅샷에서 복원할 글이 있는 카테고리를 선택해 주세요."
         else:
             action = "카테고리를 선택해 주세요."
 
@@ -2047,11 +2510,13 @@ class CategoryPickerView(discord.ui.View):
 
         category_name = value
 
+        # 새 글 작성
         if self.mode == "new":
             modal = NewArticleModal(category_name)
             await interaction.response.send_modal(modal)
             return
 
+        # 나머지는 글 목록 조회 필요
         articles = await db_get_articles_in_category(self.guild_id, category_name)
         if not articles:
             await interaction.response.send_message(
@@ -2200,7 +2665,7 @@ class CategoryDeletePickerView(discord.ui.View):
 
 @bot.tree.command(
     name="wiki_new",
-    description="위키에 새 글을 등록합니다.",
+    description="위키에 새로운 정보를 등록합니다.",
     guild=GUILD_OBJECT,
 )
 @app_commands.check(is_allowed_guild)
@@ -2237,7 +2702,7 @@ async def wiki_new(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="wiki_view",
-    description="위키 글을 조회합니다.",
+    description="위키에 등록된 정보를 조회합니다.",
     guild=GUILD_OBJECT,
 )
 @app_commands.check(is_allowed_guild)
@@ -2274,7 +2739,7 @@ async def wiki_view(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="wiki_edit",
-    description="위키 글을 수정합니다.",
+    description="위키에 등록된 정보를 수정합니다.",
     guild=GUILD_OBJECT,
 )
 @app_commands.check(is_allowed_guild)
@@ -2386,7 +2851,7 @@ async def wiki_category_add(
 
 @bot.tree.command(
     name="wiki_category_delete",
-    description="카테고리를 삭제합니다. (안의 글도 모두 함께 삭제)",
+    description="카테고리를 삭제합니다. (카테고리속 등록된 모든 정보도 함께 삭제됩니다!!!)",
     guild=GUILD_OBJECT,
 )
 @app_commands.check(is_allowed_guild)
@@ -2423,7 +2888,7 @@ async def wiki_category_delete(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="wiki_backup_restore",
-    description="최근 수정/삭제했던 내용을 되돌립니다. (최대 5개 중 선택)",
+    description="(개인용) 최근 수정/삭제했던 내용을 되돌립니다. (최대 5개 중 선택)",
     guild=GUILD_OBJECT,
 )
 @app_commands.check(is_allowed_guild)
@@ -2481,6 +2946,43 @@ async def wiki_backup_restore(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         text,
+        view=view,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="wiki_snapshot_restore",
+    description="(관리자용) 데이터 정리 시점 스냅샷(최대 3일)을 사용해 글을 복원합니다.",
+    guild=GUILD_OBJECT,
+)
+@app_commands.check(is_allowed_guild)
+@app_commands.check(has_wiki_admin_role)
+async def wiki_snapshot_restore(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "길드 안에서만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return
+
+    categories = await db_get_all_categories(guild.id)
+    if not categories:
+        await interaction.response.send_message(
+            "아직 등록된 카테고리가 없습니다.",
+            ephemeral=True,
+        )
+        return
+
+    view = CategoryPickerView(
+        mode="snapshot_restore",
+        guild_id=guild.id,
+        requester_id=interaction.user.id,
+        categories=categories,
+    )
+    await interaction.response.send_message(
+        view.get_header_text(),
         view=view,
         ephemeral=True,
     )
