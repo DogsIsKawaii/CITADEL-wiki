@@ -251,7 +251,7 @@ async def db_add_category(guild_id: int, name: str, description: Optional[str]) 
             return "ok"
 
 # =============================
-# DB 헬퍼 (백업)
+# DB 헬퍼 (백업 & 백업 목록)
 # =============================
 
 async def db_backup_current_article(
@@ -407,6 +407,82 @@ async def db_get_backups_for_user(
             )
 
         return rows
+
+
+async def db_check_backup_conflict(backup_id: int) -> Tuple[str, Optional[int]]:
+    """
+    특정 백업을 복구하기 전에,
+    같은 정보를 다른 사용자가 이후에 수정/삭제했는지 확인.
+
+    return: (conflict_type, other_user_id)
+      - conflict_type: "none", "edited_by_other", "deleted_by_other"
+      - other_user_id: 충돌을 일으킨 사용자 (없으면 None)
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        b = await conn.fetchrow(
+            """
+            SELECT id, guild_id, article_id, category_name, title,
+                   backed_at, actor_id, op_type
+            FROM wiki_article_backups
+            WHERE id=$1
+            """,
+            backup_id,
+        )
+        if not b:
+            return "none", None
+
+        guild_id = b["guild_id"]
+        article_id = b["article_id"]
+        category_name = b["category_name"]
+        title = b["title"]
+        backed_at = b["backed_at"]
+        actor_id = b["actor_id"]
+
+        # 1) article_id 가 남아 있는 경우 (글이 아직 살아있거나, 삭제 전 백업들)
+        if article_id is not None:
+            later = await conn.fetchrow(
+                """
+                SELECT actor_id, op_type
+                FROM wiki_article_backups
+                WHERE article_id=$1
+                  AND backed_at > $2
+                ORDER BY backed_at DESC
+                LIMIT 1
+                """,
+                article_id,
+                backed_at,
+            )
+            if later and later["actor_id"] and later["actor_id"] != actor_id:
+                if later["op_type"] == "edit":
+                    return "edited_by_other", later["actor_id"]
+                elif later["op_type"] == "delete":
+                    return "deleted_by_other", later["actor_id"]
+
+            return "none", None
+
+        # 2) article_id 가 NULL 이면 (이미 글이 삭제된 상태)
+        later_del = await conn.fetchrow(
+            """
+            SELECT actor_id
+            FROM wiki_article_backups
+            WHERE guild_id=$1
+              AND category_name=$2
+              AND title=$3
+              AND op_type='delete'
+              AND backed_at > $4
+            ORDER BY backed_at DESC
+            LIMIT 1
+            """,
+            guild_id,
+            category_name,
+            title,
+            backed_at,
+        )
+        if later_del and later_del["actor_id"] and later_del["actor_id"] != actor_id:
+            return "deleted_by_other", later_del["actor_id"]
+
+        return "none", None
 
 # =============================
 # DB 헬퍼 (글)
@@ -1356,12 +1432,33 @@ class BackupListView(discord.ui.View):
         category_name = target["category_name"]
         title = target["title"]
 
+        # 🔍 충돌 여부 체크 (다른 사용자가 이후에 수정/삭제했는지)
+        conflict_type, other_user_id = await db_check_backup_conflict(backup_id)
+
+        if other_user_id:
+            other_mention = f"<@{other_user_id}>"
+        else:
+            other_mention = "알 수 없는 사용자"
+
+        if conflict_type == "edited_by_other":
+            conflict_text = (
+                f"⚠️ 다른 사용자가 해당 정보를 수정하였습니다. (마지막 수정자: {other_mention})\n"
+                "정말로 백업하시겠습니까?"
+            )
+        elif conflict_type == "deleted_by_other":
+            conflict_text = (
+                f"⚠️ 다른 사용자가 해당 정보를 삭제하였습니다. (삭제한 사용자: {other_mention})\n"
+                "정말로 백업하시겠습니까?"
+            )
+        else:
+            conflict_text = "해당 정보를 이 상태로 되돌리겠습니까?"
+
         text = (
             "📦 선택한 백업 내역\n"
             f"- 작업 종류: **{op_label}**\n"
             f"- 카테고리: `{category_name}`\n"
             f"- 제목: `{title}`\n\n"
-            "해당 정보를 이 상태로 되돌리겠습니까?"
+            f"{conflict_text}"
         )
 
         view = RestoreBackupView(
@@ -2237,7 +2334,7 @@ async def wiki_delete(interaction: discord.Interaction):
     guild=GUILD_OBJECT,
 )
 @app_commands.check(is_allowed_guild)
-@app_commands.check(has_wiki_admin_role)
+@app_commands.check(has_wiki_editor_or_admin)  # ⬅ 에디터 OR 관리자 모두 가능
 @app_commands.describe(
     name="카테고리 이름",
     description="(선택) 카테고리 설명 / 비고",
