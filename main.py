@@ -2,6 +2,7 @@ import os
 import re
 import math
 import asyncio
+import datetime
 from typing import Optional, List, Tuple
 from urllib.parse import urlsplit
 
@@ -47,7 +48,7 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =============================
-# 권한 체크 함수
+# 권한 체크
 # =============================
 
 def is_allowed_guild(interaction: discord.Interaction) -> bool:
@@ -82,7 +83,7 @@ DB_LOCK = asyncio.Lock()
 
 async def init_db(pool: asyncpg.Pool):
     async with pool.acquire() as conn:
-        # 카테고리 테이블
+        # 카테고리
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS wiki_categories (
@@ -103,7 +104,7 @@ async def init_db(pool: asyncpg.Pool):
             """
         )
 
-        # 글 테이블
+        # 글
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS wiki_articles (
@@ -128,7 +129,7 @@ async def init_db(pool: asyncpg.Pool):
             """
         )
 
-        # 기여자 테이블
+        # 기여자
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS wiki_contributors (
@@ -164,7 +165,36 @@ async def init_db(pool: asyncpg.Pool):
         await conn.execute(
             """
             ALTER TABLE wiki_article_backups
+            ADD COLUMN IF NOT EXISTS op_type TEXT;
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE wiki_article_backups
             ADD COLUMN IF NOT EXISTS actor_id BIGINT;
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE wiki_article_backups
+            ADD COLUMN IF NOT EXISTS backed_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+            """
+        )
+
+        # 유지보수 메타 테이블 (마지막 정리 시각)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wiki_maintenance_meta (
+                id INTEGER PRIMARY KEY,
+                last_cleanup_at TIMESTAMPTZ
+            );
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO wiki_maintenance_meta (id, last_cleanup_at)
+            VALUES (1, NULL)
+            ON CONFLICT (id) DO NOTHING;
             """
         )
 
@@ -179,7 +209,7 @@ async def get_db_pool() -> asyncpg.Pool:
     return DB_POOL
 
 # =============================
-# DB 헬퍼 함수 (카테고리)
+# DB 헬퍼 (카테고리)
 # =============================
 
 async def db_get_all_categories(guild_id: int) -> List[asyncpg.Record]:
@@ -220,11 +250,21 @@ async def db_add_category(guild_id: int, name: str, description: Optional[str]) 
             )
             return "ok"
 
+# =============================
+# DB 헬퍼 (백업)
+# =============================
 
-async def db_backup_current_article(conn: asyncpg.Connection, article_id: int, op_type: str, actor_id: int):
+async def db_backup_current_article(
+    conn: asyncpg.Connection,
+    article_id: int,
+    op_type: str,
+    actor_id: int,
+):
     """
     현재 글 상태를 백업 테이블에 저장.
-    - 동일 article_id + actor_id 조합의 직전 백업은 삭제하고 새로 1건만 유지
+
+    - 사용자별(= guild_id + actor_id 기준)로 백업을 '최근 5개'까지만 유지.
+    - 어떤 유저가 6번째 백업을 생성하면 가장 오래된 1개가 밀려나서 삭제됨.
     """
     art_row = await conn.fetchrow(
         """
@@ -241,12 +281,9 @@ async def db_backup_current_article(conn: asyncpg.Connection, article_id: int, o
     if not art_row:
         return
 
-    await conn.execute(
-        "DELETE FROM wiki_article_backups WHERE article_id=$1 AND actor_id=$2",
-        article_id,
-        actor_id,
-    )
+    guild_id = art_row["guild_id"]
 
+    # 새 백업 추가
     await conn.execute(
         """
         INSERT INTO wiki_article_backups
@@ -255,7 +292,7 @@ async def db_backup_current_article(conn: asyncpg.Connection, article_id: int, o
              op_type, actor_id)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         """,
-        art_row["guild_id"],
+        guild_id,
         art_row["id"],
         art_row["category_name"],
         art_row["title"],
@@ -265,6 +302,25 @@ async def db_backup_current_article(conn: asyncpg.Connection, article_id: int, o
         art_row["created_at"],
         art_row["updated_at"],
         op_type,
+        actor_id,
+    )
+
+    # 같은 (guild_id, actor_id)에 대해 '최근 5개'만 남기고 나머지 삭제
+    await conn.execute(
+        """
+        DELETE FROM wiki_article_backups b
+        WHERE b.guild_id = $1
+          AND b.actor_id = $2
+          AND b.id NOT IN (
+              SELECT id
+              FROM wiki_article_backups
+              WHERE guild_id = $1
+                AND actor_id = $2
+              ORDER BY backed_at DESC
+              LIMIT 5
+          );
+        """,
+        guild_id,
         actor_id,
     )
 
@@ -299,33 +355,61 @@ async def db_delete_category(guild_id: int, name: str, actor_id: int) -> Tuple[s
             await conn.execute("DELETE FROM wiki_categories WHERE id=$1", cat_id)
             return "ok", deleted_count
 
-# =============================
-# DB 헬퍼 함수 (백업 조회)
-# =============================
 
-async def db_get_last_backup_for_user(guild_id: int, user_id: int) -> Optional[asyncpg.Record]:
+async def db_get_backups_for_user(
+    guild_id: int,
+    user_id: int,
+    limit: int = 5,
+) -> List[asyncpg.Record]:
     """
-    해당 길드 + 해당 유저 기준으로 가장 최근 백업 1건 조회
+    해당 길드 + 해당 유저 기준으로 '최근 N개' 백업 목록 조회.
+    단, 마지막 정리 시각(last_cleanup_at) 이후에 생성된 백업만 대상.
     """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, article_id, category_name, title, content,
-                   created_by_id, created_by_name, created_at, updated_at,
-                   op_type, backed_at, actor_id
-            FROM wiki_article_backups
-            WHERE guild_id=$1 AND actor_id=$2
-            ORDER BY backed_at DESC
-            LIMIT 1
-            """,
-            guild_id,
-            user_id,
+        last_cleanup_at = await conn.fetchval(
+            "SELECT last_cleanup_at FROM wiki_maintenance_meta WHERE id=1"
         )
-        return row
+
+        if last_cleanup_at is None:
+            # 아직 정리가 한 번도 안 돌았으면 시간 제한 없이 최근 N개
+            rows = await conn.fetch(
+                """
+                SELECT id, article_id, category_name, title, content,
+                       created_by_id, created_by_name, created_at, updated_at,
+                       op_type, backed_at, actor_id
+                FROM wiki_article_backups
+                WHERE guild_id=$1 AND actor_id=$2
+                ORDER BY backed_at DESC
+                LIMIT $3
+                """,
+                guild_id,
+                user_id,
+                limit,
+            )
+        else:
+            # 마지막 정리 이후에 만들어진 백업만
+            rows = await conn.fetch(
+                """
+                SELECT id, article_id, category_name, title, content,
+                       created_by_id, created_by_name, created_at, updated_at,
+                       op_type, backed_at, actor_id
+                FROM wiki_article_backups
+                WHERE guild_id=$1 AND actor_id=$2
+                  AND backed_at > $4
+                ORDER BY backed_at DESC
+                LIMIT $3
+                """,
+                guild_id,
+                user_id,
+                limit,
+                last_cleanup_at,
+            )
+
+        return rows
 
 # =============================
-# DB 헬퍼 함수 (글)
+# DB 헬퍼 (글)
 # =============================
 
 async def db_upsert_article(
@@ -337,9 +421,9 @@ async def db_upsert_article(
     user_name: str,
 ):
     """
-    새 글 '생성 전용' 함수.
-    - 동일 카테고리 + 제목이 이미 있으면 아무 것도 변경하지 않고 "dup" 반환
-    - 성공 시 ("created", 기여횟수=1) 반환
+    새 글 '생성 전용'.
+    - 동일 카테고리+제목이 이미 있으면 "dup" 반환, DB 변경 없음
+    - 성공 시 ("created", 1) 반환
     """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
@@ -455,8 +539,8 @@ async def db_edit_article(
     user_id: int,
 ):
     """
-    제목 + 내용 수정. 제목 변경 시 중복 체크.
-    성공시 ("ok", 기여횟수)
+    제목 + 내용 수정 (제목 변경 시 중복 체크 포함).
+    - 수정 전에 백업 저장.
     """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
@@ -497,6 +581,7 @@ async def db_edit_article(
                 if dup_row:
                     return "dup_title", None
 
+            # 수정 전 백업
             await db_backup_current_article(conn, article_id, "edit", user_id)
 
             await conn.execute(
@@ -565,6 +650,7 @@ async def db_delete_article(
 
             article_id = art_row["id"]
 
+            # 삭제 전 백업
             await db_backup_current_article(conn, article_id, "delete", actor_id)
 
             await conn.execute("DELETE FROM wiki_articles WHERE id=$1", article_id)
@@ -592,50 +678,67 @@ async def db_search_articles(guild_id: int, query: str, limit: int = 10) -> List
         return rows
 
 # =============================
-# 백업 정리(최적화) 작업
+# 백업 정리(24시간마다)
 # =============================
 
 async def compact_backups_once():
     """
-    - article_id 가 살아있는 백업들은 현재 wiki_articles 내용으로 동기화
-    - article_id 가 NULL 인(= 실제 글이 이미 삭제된) 백업들은 삭제
+    백업 테이블 정리 (24시간마다 실행):
+
+    1) 살아있는 글들(article_id NOT NULL)에 대해
+       - 같은 (article_id, actor_id) 그룹 안에서
+       - 가장 최신(backed_at 기준) 백업 1개만 남기고 나머지 삭제
+
+    2) 이미 실제 글이 삭제되어 article_id 가 NULL 로 된 백업은 전부 삭제
+
+    3) 마지막 정리 시각(last_cleanup_at)을 NOW()로 기록
+       → 이후 /wiki_backup_restore 는 이 시각 이후의 백업만 복구 대상으로 사용
     """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            updated = await conn.execute(
+            # 1) 살아있는 글의 과거 백업 정리
+            delete_non_latest = await conn.execute(
                 """
-                UPDATE wiki_article_backups AS b
-                SET category_name   = c.name,
-                    title           = a.title,
-                    content         = a.content,
-                    created_by_id   = a.created_by_id,
-                    created_by_name = a.created_by_name,
-                    created_at      = a.created_at,
-                    updated_at      = a.updated_at
-                FROM wiki_articles AS a
-                JOIN wiki_categories AS c
-                  ON c.id = a.category_id
-                WHERE b.article_id = a.id
-                  AND b.guild_id   = a.guild_id;
+                WITH latest AS (
+                    SELECT MAX(id) AS id
+                    FROM wiki_article_backups
+                    WHERE article_id IS NOT NULL
+                    GROUP BY article_id, actor_id
+                )
+                DELETE FROM wiki_article_backups b
+                WHERE b.article_id IS NOT NULL
+                  AND b.id NOT IN (SELECT id FROM latest);
                 """
             )
 
-            deleted = await conn.execute(
+            # 2) 이미 삭제된 글의 백업 삭제
+            delete_orphans = await conn.execute(
                 """
                 DELETE FROM wiki_article_backups
                 WHERE article_id IS NULL;
                 """
             )
 
-    print(f"⏱️ 백업 정리 1회 실행 완료. 결과: {updated}, {deleted}")
+            # 3) 정리 시각 기록
+            await conn.execute(
+                """
+                INSERT INTO wiki_maintenance_meta (id, last_cleanup_at)
+                VALUES (1, NOW())
+                ON CONFLICT (id)
+                DO UPDATE SET last_cleanup_at = EXCLUDED.last_cleanup_at;
+                """
+            )
+
+    print(
+        f"⏱️ 백업 정리 1회 실행 완료. "
+        f"살아있는 글의 과거 백업 정리 결과: {delete_non_latest}, "
+        f"고아(삭제된 글) 백업 삭제 결과: {delete_orphans}"
+    )
 
 
 @tasks.loop(hours=24)
 async def backup_maintenance_task():
-    """
-    24시간 간격으로 백업 정리 작업 실행
-    """
     try:
         await compact_backups_once()
     except Exception as e:
@@ -656,9 +759,9 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 def split_content_and_images(content: str) -> Tuple[str, List[str]]:
     """
-    내용 문자열 안에서 여러 이미지 URL을 찾아:
-    - 내용에서는 각 이미지 URL을 '[이미지1]', '[이미지2]' ... 로 치환하고
-    - 이미지 URL 리스트를 순서대로 반환한다.
+    내용 문자열 안에서 이미지 URL을 찾아:
+    - 내용에서는 [이미지1], [이미지2] ... 로 치환
+    - 실제 URL 리스트를 반환
     """
     image_urls: List[str] = []
     index = 0
@@ -688,9 +791,9 @@ def build_article_embeds(
     contrib_rows: List[asyncpg.Record],
 ) -> List[discord.Embed]:
     """
-    글 1개를 여러 Embed로 분리해서 반환:
-    - 첫 번째 Embed: 텍스트(본문) + 작성자/기여자 정보
-    - 이후 Embed들: 이미지 전용 embed (이미지 개수만큼, 제한 없음)
+    글 1개를 여러 Embed로 분리:
+    - 첫 Embed: 본문 + 작성자/기여자 정보
+    - 이후 Embeds: 이미지 전용
     """
     cleaned_content, image_urls = split_content_and_images(art_row["content"])
 
@@ -732,8 +835,7 @@ async def send_embeds_with_chunking(
     ephemeral: bool = False,
 ):
     """
-    디스코드 제한(메시지당 최대 10개 embed)을 고려하여
-    여러 번의 메시지로 나누어 embed들을 전송한다.
+    디스코드 제한(메시지당 최대 10개 embed)에 맞춰 여러 번 나눠 전송
     """
     if not embeds:
         return
@@ -821,7 +923,7 @@ class NewArticleModal(discord.ui.Modal):
         )
 
 # =============================
-# UI: 글 수정 모달 + 확인 뷰
+# UI: 수정 확인 / 수정 모달
 # =============================
 
 class EditConfirmView(discord.ui.View):
@@ -951,7 +1053,7 @@ class EditArticleModal(discord.ui.Modal):
         )
 
 # =============================
-# UI: 삭제 확인 뷰
+# UI: 삭제 확인
 # =============================
 
 class DeleteConfirmView(discord.ui.View):
@@ -1128,6 +1230,7 @@ class RestoreBackupView(discord.ui.View):
                     )
                     article_id = art_row["id"]
 
+                # 복구 완료 후, 이 백업은 삭제 (한 번 사용된 백업)
                 await conn.execute(
                     "DELETE FROM wiki_article_backups WHERE id=$1",
                     backup["id"],
@@ -1153,8 +1256,139 @@ class RestoreBackupView(discord.ui.View):
             view=None,
         )
 
+
+class BackupListView(discord.ui.View):
+    """
+    최근 백업 5개 목록을 Select로 보여주고,
+    선택한 백업에 대해 RestoreBackupView로 복구 여부를 물어보는 뷰.
+    """
+    def __init__(
+        self,
+        guild_id: int,
+        requester_id: int,
+        backups: List[asyncpg.Record],
+    ):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.requester_id = requester_id
+        self.backups = backups
+
+        options: List[discord.SelectOption] = []
+        for b in backups:
+            op_type = b["op_type"]
+            if op_type == "edit":
+                op_label = "수정"
+            elif op_type == "delete":
+                op_label = "삭제"
+            else:
+                op_label = op_type
+
+            label = f"[{op_label}] [{b['category_name']}] {b['title']}"
+            if len(label) > 100:
+                label = label[:97] + "..."
+
+            ts = b["backed_at"]
+            if isinstance(ts, datetime.datetime):
+                time_str = ts.strftime("%Y-%m-%d %H:%M")
+            else:
+                time_str = str(ts)
+
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=time_str,
+                    value=str(b["id"]),
+                )
+            )
+
+        self.select = discord.ui.Select(
+            placeholder="복원할 백업을 선택하세요",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.select.callback = self._on_select
+        self.add_item(self.select)
+
+        cancel_btn = discord.ui.Button(
+            label="취소",
+            style=discord.ButtonStyle.secondary,
+        )
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    async def _check_user(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "이 선택 창은 명령어를 실행한 사용자만 사용할 수 있습니다.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _on_select(self, interaction: discord.Interaction):
+        if not await self._check_user(interaction):
+            return
+
+        backup_id = int(self.select.values[0])
+
+        target = None
+        for b in self.backups:
+            if b["id"] == backup_id:
+                target = b
+                break
+
+        if target is None:
+            await interaction.response.send_message(
+                "선택한 백업 데이터를 찾을 수 없습니다.",
+                ephemeral=True,
+            )
+            return
+
+        op_type = target["op_type"]
+        if op_type == "edit":
+            op_label = "수정"
+        elif op_type == "delete":
+            op_label = "삭제"
+        else:
+            op_label = op_type
+
+        category_name = target["category_name"]
+        title = target["title"]
+
+        text = (
+            "📦 선택한 백업 내역\n"
+            f"- 작업 종류: **{op_label}**\n"
+            f"- 카테고리: `{category_name}`\n"
+            f"- 제목: `{title}`\n\n"
+            "해당 정보를 이 상태로 되돌리겠습니까?"
+        )
+
+        view = RestoreBackupView(
+            backup_id=backup_id,
+            guild_id=self.guild_id,
+            category_name=category_name,
+            title=title,
+            requester_id=self.requester_id,
+        )
+
+        await interaction.response.send_message(
+            text,
+            view=view,
+            ephemeral=True,
+        )
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        if not await self._check_user(interaction):
+            return
+
+        await interaction.response.edit_message(
+            content="백업 복원을 취소했습니다.",
+            view=None,
+        )
+
 # =============================
-# UI: 검색 모달 + 결과 뷰
+# UI: 검색 모달 / 검색 결과 뷰
 # =============================
 
 class SearchModal(discord.ui.Modal):
@@ -1209,8 +1443,6 @@ class SearchModal(discord.ui.Modal):
             results=rows,
         )
 
-        lines = [f"- [{r['category_name']}] {r['title']}" for r in rows]
-
         if self.mode == "view":
             action_text = "조회할 글을 선택해 주세요."
         elif self.mode == "edit":
@@ -1219,6 +1451,8 @@ class SearchModal(discord.ui.Modal):
             action_text = "삭제할 글을 선택해 주세요."
         else:
             action_text = "처리할 글을 선택해 주세요."
+
+        lines = [f"- [{r['category_name']}] {r['title']}" for r in rows]
 
         text = (
             "🔍 검색 결과 (최대 10개):\n"
@@ -1337,7 +1571,7 @@ class SearchResultView(discord.ui.View):
             return
 
 # =============================
-# UI: 카테고리/글 선택 뷰 (페이지네이션)
+# UI: 카테고리 / 글 선택 (페이지네이션)
 # =============================
 
 class ArticlePickerView(discord.ui.View):
@@ -1543,6 +1777,7 @@ class ArticlePickerView(discord.ui.View):
             )
             return
 
+
 class CategoryPickerView(discord.ui.View):
     def __init__(
         self,
@@ -1723,7 +1958,7 @@ class CategoryPickerView(discord.ui.View):
         )
 
 # =============================
-# UI: 카테고리 삭제 선택 뷰
+# UI: 카테고리 삭제
 # =============================
 
 class CategoryDeleteConfirmView(discord.ui.View):
@@ -1838,14 +2073,14 @@ class CategoryDeletePickerView(discord.ui.View):
             requester_id=self.requester_id,
         )
         await interaction.response.send_message(
-            f"⚠️ 카테고리를 삭제할 시 카테고리내에 등록된 모든 정보가 삭제됩니다!\n\n"
+            "⚠️ 카테고리를 삭제할 시 카테고리내에 등록된 모든 정보가 삭제됩니다!\n\n"
             f"정말로 `{value}` 카테고리를 삭제하시겠습니까?",
             view=view,
             ephemeral=True,
         )
 
 # =============================
-# Slash 명령어들
+# Slash 명령어
 # =============================
 
 @bot.tree.command(
@@ -2073,7 +2308,7 @@ async def wiki_category_delete(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="wiki_backup_restore",
-    description="직전에 수정/삭제했던 내용을 되돌립니다.",
+    description="최근 수정/삭제했던 내용을 되돌립니다. (최대 5개 중 선택)",
     guild=GUILD_OBJECT,
 )
 @app_commands.check(is_allowed_guild)
@@ -2087,33 +2322,46 @@ async def wiki_backup_restore(interaction: discord.Interaction):
         )
         return
 
-    backup = await db_get_last_backup_for_user(guild.id, interaction.user.id)
-    if not backup:
+    backups = await db_get_backups_for_user(guild.id, interaction.user.id, limit=5)
+    if not backups:
         await interaction.response.send_message(
-            "당신이 수정/삭제한 내역 중 되돌릴 수 있는 백업 데이터가 없습니다.",
+            "복구 가능한 백업 데이터가 없습니다.\n"
+            "백업은 데이터 정리(24시간 주기) 이후에는 사용할 수 없으며,\n"
+            "정리 이후에 새로 수정/삭제한 내역만 복구할 수 있습니다.",
             ephemeral=True,
         )
         return
 
-    category_name = backup["category_name"]
-    title = backup["title"]
-    op_type = backup["op_type"]
+    lines = []
+    for idx, b in enumerate(backups, start=1):
+        op_type = b["op_type"]
+        if op_type == "edit":
+            op_label = "수정"
+        elif op_type == "delete":
+            op_label = "삭제"
+        else:
+            op_label = op_type
 
-    msg_type = "수정" if op_type == "edit" else "삭제"
+        ts = b["backed_at"]
+        if isinstance(ts, datetime.datetime):
+            time_str = ts.strftime("%Y-%m-%d %H:%M")
+        else:
+            time_str = str(ts)
+
+        lines.append(
+            f"{idx}. [{op_label}] [{b['category_name']}] {b['title']} ({time_str})"
+        )
 
     text = (
-        f"📦 당신이 가장 최근에 {msg_type}한 내역\n"
-        f"- 카테고리: `{category_name}`\n"
-        f"- 제목: `{title}`\n\n"
-        "해당 정보를 직전 상태로 되돌리겠습니까?"
+        "📦 최근 수정/삭제 내역 (최대 5개)\n"
+        + "\n".join(lines)
+        + "\n\n복원할 항목을 선택해 주세요."
     )
 
-    view = RestoreBackupView(
-        backup_id=backup["id"],
+    view = BackupListView(
         guild_id=guild.id,
-        category_name=category_name,
-        title=title,
         requester_id=interaction.user.id,
+        backups=backups,
     )
 
     await interaction.response.send_message(
