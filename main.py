@@ -42,6 +42,9 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+# -----------------------------
+# 권한 체크 함수
+# -----------------------------
 def is_allowed_guild(interaction: discord.Interaction) -> bool:
     """지정된 서버에서만 Slash 명령어가 동작하도록 체크"""
     return interaction.guild is not None and interaction.guild.id == ALLOWED_GUILD_ID
@@ -55,10 +58,18 @@ def has_wiki_admin_role(interaction: discord.Interaction) -> bool:
 
 
 def has_wiki_editor_role(interaction: discord.Interaction) -> bool:
-    """추가/수정/조회 명령어를 사용할 수 있는 역할 체크"""
+    """추가/수정/조회 명령어를 사용할 수 있는 역할 체크 (에디터 전용)"""
     if not isinstance(interaction.user, discord.Member):
         return False
     return any(role.id == WIKI_EDITOR_ROLE_ID for role in interaction.user.roles)
+
+
+def has_wiki_editor_or_admin(interaction: discord.Interaction) -> bool:
+    """에디터 역할이나 관리자 역할 둘 중 하나라도 있으면 통과"""
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    role_ids = {role.id for role in interaction.user.roles}
+    return (WIKI_EDITOR_ROLE_ID in role_ids) or (WIKI_ADMIN_ROLE_ID in role_ids)
 
 
 # -----------------------------
@@ -182,7 +193,7 @@ class NewArticleView(discord.ui.View):
 # -----------------------------
 @bot.tree.command(name="wiki_new", description="위키에 새 글을 등록합니다.")
 @app_commands.check(is_allowed_guild)
-@app_commands.check(has_wiki_editor_role)
+@app_commands.check(has_wiki_editor_or_admin)  # 에디터 또는 관리자
 async def wiki_new(interaction: discord.Interaction):
     """카테고리 선택 → 모달로 제목/내용 입력"""
     view = NewArticleView()
@@ -213,7 +224,7 @@ category_choices = [
 
 @bot.tree.command(name="wiki_view", description="위키 글을 조회합니다.")
 @app_commands.check(is_allowed_guild)
-@app_commands.check(has_wiki_editor_role)
+@app_commands.check(has_wiki_editor_or_admin)  # 에디터 또는 관리자
 @app_commands.describe(category="조회할 카테고리", title="글 제목")
 @app_commands.choices(category=category_choices)
 async def wiki_view(
@@ -318,7 +329,7 @@ class EditArticleModal(discord.ui.Modal):
 
 @bot.tree.command(name="wiki_edit", description="위키 글을 수정합니다.")
 @app_commands.check(is_allowed_guild)
-@app_commands.check(has_wiki_editor_role)
+@app_commands.check(has_wiki_editor_or_admin)  # 에디터 또는 관리자
 @app_commands.describe(category="수정할 카테고리", title="글 제목")
 @app_commands.choices(category=category_choices)
 async def wiki_edit(
@@ -402,19 +413,26 @@ async def wiki_delete_error(interaction: discord.Interaction, error: app_command
 
 
 # -----------------------------
-# on_ready: 명령어 싱크
+# on_ready: 명령어 싱크 + 로그
 # -----------------------------
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"✅ 봇 로그인 완료: {bot.user} (ID: {bot.user.id})")
+    print("✅ DB 초기화 완료 (메모리 저장소 사용)")
+
     try:
+        # 특정 길드에만 슬래시 명령어 동기화
         guild_obj = discord.Object(id=ALLOWED_GUILD_ID)
         synced = await bot.tree.sync(guild=guild_obj)
-        print(f"Synced {len(synced)} commands to guild {ALLOWED_GUILD_ID}")
+        print(f"✅ 슬래시 명령어 {len(synced)}개 길드 동기화 완료 (guild_id={ALLOWED_GUILD_ID})")
+        print("✅ 봇 준비 완료 & 슬래시 명령어 동기화 완료")
     except Exception as e:
-        print("Slash command sync error:", e)
+        print("❌ 슬래시 명령어 동기화 중 오류:", e)
 
 
+# -----------------------------
+# 메인 실행
+# -----------------------------
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN 환경 변수를 설정해 주세요.")
